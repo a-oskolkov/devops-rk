@@ -1,0 +1,23 @@
+[
+  {
+    "id": 1,
+    "name": "Wireless Mouse",
+    "price": 1290,
+    "currency": "RUB",
+    "in_stock": true
+  },
+  {
+    "id": 2,
+    "name": "Mechanical Keyboard",
+    "price": 5490,
+    "currency": "RUB",
+    "in_stock": true
+  },
+  {
+    "id": 3,
+    "name": "USB-C Hub",
+    "price": 2490,
+    "currency": "RUB",
+    "in_stock": false
+  }
+]
