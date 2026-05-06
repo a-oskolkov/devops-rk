@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  LOCAL_IMAGE_NAME: devops-rk-backend
+
+jobs:
+  # этап lint проверяет стиль и типовые ошибки кода через ruff
+  # условие запуска: стартует на push и pull_request сразу, параллельно с unit-test
+  # артефакты: сохраняет текстовый отчет ruff
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r app/requirements-dev.txt
+
+      - name: Run ruff
+        run: |
+          set -o pipefail
+          mkdir -p artifacts/lint
+          ruff check app | tee artifacts/lint/ruff-report.txt
+
+      - name: Upload lint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: artifacts/lint/ruff-report.txt
+
+  # этап unit-test запускает unit тесты
+  # условие запуска: стартует на push и pull_request сразу, параллельно с lint
+  # артефакты: сохраняет xml отчет
+  unit-test:
+    name: unit-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r app/requirements-dev.txt
+
+      - name: Run unit tests
+        run: |
+          mkdir -p artifacts/tests
+          pytest app/tests --junitxml=artifacts/tests/pytest-report.xml
+
+      - name: Upload unit-test artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: artifacts/tests/pytest-report.xml
+
+  # этап build собирает docker образ только после успешных lint и unit-test
+  # условие запуска: середина Diamond Pattern после двух параллельных веток lint и unit_test
+  # артефакты: сохраняет docker image tar
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - unit-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.LOCAL_IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Save Docker image as artifact
+        run: |
+          mkdir -p artifacts/image
+          docker save ${{ env.LOCAL_IMAGE_NAME }}:${{ github.sha }} -o artifacts/image/backend-image.tar
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image
+          path: artifacts/image/backend-image.tar
+          retention-days: 1
+
+  # этап integration-test поднимает контейнер из образа и дергает эндпоинты curlом
+  # условие запуска: выполняется только после успешной сборки docker образа на этапе build
+  # артефакты: сохраняет ответы curl и docker logs 
+  integration-test:
+    name: integration-test
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image
+          path: artifacts/image
+
+      - name: Load Docker image
+        run: docker load -i artifacts/image/backend-image.tar
+
+      - name: Run container
+        run: docker run -d --name backend-under-test -p 5000:5000 ${{ env.LOCAL_IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Check HTTP endpoints
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/integration
+          for attempt in {1..10}; do
+            if curl -fsS http://127.0.0.1:5000/health > artifacts/integration/health.json; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:5000/products > artifacts/integration/products.json
+          curl -fsS http://127.0.0.1:5000/products/1 > artifacts/integration/product-1.json
+          status_code="$(curl -sS -o artifacts/integration/product-404.json -w "%{http_code}" http://127.0.0.1:5000/products/999)"
+          test "$status_code" = "404"
+
+      - name: Save container logs
+        if: always()
+        run: docker logs backend-under-test > artifacts/integration/container.log 2>&1 || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f backend-under-test || true
+
+      - name: Upload integration-test artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report
+          path: artifacts/integration
+
+  # этап deploy публикует проверенный docker образ в github container registry
+  # условие запуска: только после успешного integration-test и только при push в ветку main
+  # артефакты: сохраняет файл с итоговыми registry тегами, чтобы было видно, что именно отправлено в registry
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image
+          path: artifacts/image
+
+      - name: Load Docker image
+        run: docker load -i artifacts/image/backend-image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push image
+        run: |
+          mkdir -p artifacts/deploy
+          IMAGE_NAME="$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          docker tag ${{ env.LOCAL_IMAGE_NAME }}:${{ github.sha }} "$IMAGE_NAME:${{ github.sha }}"
+          docker tag ${{ env.LOCAL_IMAGE_NAME }}:${{ github.sha }} "$IMAGE_NAME:latest"
+
+          docker push "$IMAGE_NAME:${{ github.sha }}"
+          docker push "$IMAGE_NAME:latest"
+
+          {
+            echo "$IMAGE_NAME:${{ github.sha }}"
+            echo "$IMAGE_NAME:latest"
+          } > artifacts/deploy/pushed-image.txt
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-report
+          path: artifacts/deploy/pushed-image.txt
